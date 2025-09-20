@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-"""This python script is designed to run inference on a dataset using either the OpenAI or Anthropic API, depending on the model specified.
+"""This python script is designed to run inference on a dataset using either the OpenAI, Anthropic, or LMStudio API, depending on the model specified.
 It sorts instances by length and continually writes the outputs to a specified file, so that the script can be stopped and restarted without losing progress.
 """
 
@@ -14,6 +14,7 @@ from tqdm.auto import tqdm
 import numpy as np
 import tiktoken
 import openai
+import requests
 from anthropic import HUMAN_PROMPT, AI_PROMPT, Anthropic
 from tenacity import (
     retry,
@@ -42,6 +43,7 @@ MODEL_LIMITS = {
     "gpt-4-0613": 8_192,
     "gpt-4-1106-preview": 128_000,
     "gpt-4-0125-preview": 128_000,
+    "lmstudio": 128_000,  # Default limit for LMStudio models
 }
 
 # The cost per token for each model input.
@@ -61,6 +63,7 @@ MODEL_COST_PER_INPUT = {
     "gpt-4-32k": 0.00006,
     "gpt-4-1106-preview": 0.00001,
     "gpt-4-0125-preview": 0.00001,
+    "lmstudio": 0.0,  # Local model, no cost
 }
 
 # The cost per token for each model output.
@@ -80,6 +83,7 @@ MODEL_COST_PER_OUTPUT = {
     "gpt-4-32k": 0.00012,
     "gpt-4-1106-preview": 0.00003,
     "gpt-4-0125-preview": 0.00003,
+    "lmstudio": 0.0,  # Local model, no cost
 }
 
 # used for azure
@@ -156,6 +160,87 @@ def call_chat(model_name_or_path, inputs, use_azure, temperature, top_p, **model
         if e.code == "context_length_exceeded":
             print("Context length exceeded")
             return None
+        raise e
+
+
+@retry(wait=wait_random_exponential(min=30, max=600), stop=stop_after_attempt(3))
+def call_lmstudio(inputs, lmstudio_url, temperature, top_p, **model_args):
+    """
+    Calls the LMStudio API to generate completions for the given inputs.
+
+    Args:
+    inputs (str): The inputs to generate completions for.
+    lmstudio_url (str): The URL of the LMStudio server (e.g., "http://localhost:1234").
+    temperature (float): The temperature to use.
+    top_p (float): The top_p to use.
+    **model_args (dict): A dictionary of model arguments.
+    """
+    system_messages = inputs.split("\n", 1)[0]
+    user_message = inputs.split("\n", 1)[1]
+    
+    try:
+        # Prepare the request payload for LMStudio
+        payload = {
+            "model": "local-model",  # LMStudio uses a generic model name
+            "messages": [
+                {"role": "system", "content": system_messages},
+                {"role": "user", "content": user_message},
+            ],
+            "temperature": temperature,
+            "top_p": top_p,
+            "stream": False,
+            **model_args,
+        }
+        
+        # Make the request to LMStudio
+        response = requests.post(
+            f"{lmstudio_url}/v1/chat/completions",
+            json=payload,
+            headers={"Content-Type": "application/json"},
+            timeout=300,  # 5 minute timeout
+        )
+        response.raise_for_status()
+        
+        result = response.json()
+        
+        # Extract the completion and usage information
+        completion = result["choices"][0]["message"]["content"]
+        usage = result.get("usage", {})
+        input_tokens = usage.get("prompt_tokens", 0)
+        output_tokens = usage.get("completion_tokens", 0)
+        
+        # Calculate cost (0 for local models)
+        cost = calc_cost("lmstudio", input_tokens, output_tokens)
+        
+        # Create a mock response object similar to OpenAI's format
+        class MockResponse:
+            def __init__(self, completion, model, usage):
+                self.choices = [MockChoice(completion)]
+                self.model = model
+                self.usage = MockUsage(usage)
+        
+        class MockChoice:
+            def __init__(self, content):
+                self.message = MockMessage(content)
+        
+        class MockMessage:
+            def __init__(self, content):
+                self.content = content
+        
+        class MockUsage:
+            def __init__(self, usage):
+                self.prompt_tokens = usage.get("prompt_tokens", 0)
+                self.completion_tokens = usage.get("completion_tokens", 0)
+        
+        mock_response = MockResponse(completion, "lmstudio", usage)
+        return mock_response, cost
+        
+    except requests.exceptions.RequestException as e:
+        logger.error(f"LMStudio API request failed: {e}")
+        raise e
+    except (KeyError, IndexError) as e:
+        logger.error(f"Unexpected response format from LMStudio: {e}")
+        logger.error(f"Response: {result if 'result' in locals() else 'No response received'}")
         raise e
 
 
@@ -403,6 +488,86 @@ def anthropic_inference(
                 break
 
 
+def lmstudio_inference(
+    test_dataset,
+    model_name_or_path,
+    output_file,
+    model_args,
+    existing_ids,
+    max_cost,
+):
+    """
+    Runs inference on a dataset using the LMStudio API.
+
+    Args:
+    test_dataset (datasets.Dataset): The dataset to run inference on.
+    model_name_or_path (str): The name or path of the model to use.
+    output_file (str): The path to the output file.
+    model_args (dict): A dictionary of model arguments.
+    existing_ids (set): A set of ids that have already been processed.
+    max_cost (float): The maximum cost to spend on inference.
+    """
+    # Get LMStudio URL from environment variable or use default
+    lmstudio_url = os.environ.get("LMSTUDIO_URL", "http://localhost:1234")
+    print(f"Using LMStudio URL: {lmstudio_url}")
+    
+    # Use a simple tokenizer for length estimation (GPT-4 tokenizer as fallback)
+    try:
+        encoding = tiktoken.encoding_for_model("gpt-4")
+        tokenize_func = lambda x: gpt_tokenize(x, encoding)
+    except:
+        # Fallback to simple character-based estimation
+        tokenize_func = lambda x: len(x) // 4  # Rough estimate: 4 chars per token
+    
+    # Filter dataset by token length
+    test_dataset = test_dataset.filter(
+        lambda x: tokenize_func(x["text"]) <= MODEL_LIMITS["lmstudio"],
+        desc="Filtering",
+        load_from_cache_file=False,
+    )
+    
+    temperature = model_args.pop("temperature", 0.2)
+    top_p = model_args.pop("top_p", 0.95 if temperature > 0 else 1)
+    print(f"Using temperature={temperature}, top_p={top_p}")
+    
+    basic_args = {
+        "model_name_or_path": model_name_or_path,
+    }
+    total_cost = 0
+    print(f"Filtered to {len(test_dataset)} instances")
+    
+    with open(output_file, "a+") as f:
+        for datum in tqdm(test_dataset, desc=f"Inference for {model_name_or_path}"):
+            instance_id = datum["instance_id"]
+            if instance_id in existing_ids:
+                continue
+            output_dict = {"instance_id": instance_id}
+            output_dict.update(basic_args)
+            output_dict["text"] = f"{datum['text']}\n\n"
+            
+            try:
+                response, cost = call_lmstudio(
+                    output_dict["text"],
+                    lmstudio_url,
+                    temperature,
+                    top_p,
+                    **model_args,
+                )
+                completion = response.choices[0].message.content
+                total_cost += cost
+                print(f"Total Cost: {total_cost:.2f}")
+                output_dict["full_output"] = completion
+                output_dict["model_patch"] = extract_diff(completion)
+                print(json.dumps(output_dict), file=f, flush=True)
+                if max_cost is not None and total_cost >= max_cost:
+                    print(f"Reached max cost {max_cost}, exiting")
+                    break
+            except Exception as e:
+                logger.error(f"Error processing instance {instance_id}: {e}")
+                traceback.print_exc()
+                continue
+
+
 def parse_model_args(model_args):
     """
     Parses a string of model arguments and returns a dictionary of keyword arguments.
@@ -503,6 +668,8 @@ def main(
         anthropic_inference(**inference_args)
     elif model_name_or_path.startswith("gpt"):
         openai_inference(**inference_args)
+    elif model_name_or_path.startswith("lmstudio"):
+        lmstudio_inference(**inference_args)
     else:
         raise ValueError(f"Invalid model name or path {model_name_or_path}")
     logger.info("Done!")
