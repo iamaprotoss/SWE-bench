@@ -175,8 +175,15 @@ def call_lmstudio(inputs, lmstudio_url, temperature, top_p, **model_args):
     top_p (float): The top_p to use.
     **model_args (dict): A dictionary of model arguments.
     """
-    system_messages = inputs.split("\n", 1)[0]
-    user_message = inputs.split("\n", 1)[1]
+    # Split inputs into system and user messages
+    parts = inputs.split("\n", 1)
+    if len(parts) == 2:
+        system_messages = parts[0]
+        user_message = parts[1]
+    else:
+        # If no system message, use the entire input as user message
+        system_messages = "You are a helpful coding assistant."
+        user_message = inputs
     
     try:
         # Prepare the request payload for LMStudio
@@ -199,7 +206,10 @@ def call_lmstudio(inputs, lmstudio_url, temperature, top_p, **model_args):
             headers={"Content-Type": "application/json"},
             timeout=300,  # 5 minute timeout
         )
-        response.raise_for_status()
+        
+        if response.status_code != 200:
+            logger.error(f"LMStudio API error {response.status_code}: {response.text}")
+            response.raise_for_status()
         
         result = response.json()
         
@@ -235,8 +245,14 @@ def call_lmstudio(inputs, lmstudio_url, temperature, top_p, **model_args):
         mock_response = MockResponse(completion, "lmstudio", usage)
         return mock_response, cost
         
+    except requests.exceptions.ConnectionError as e:
+        logger.error(f"Failed to connect to LMStudio at {lmstudio_url}. Make sure LMStudio is running and the server is started.")
+        raise e
     except requests.exceptions.RequestException as e:
         logger.error(f"LMStudio API request failed: {e}")
+        if hasattr(e, 'response') and e.response is not None:
+            logger.error(f"Response status: {e.response.status_code}")
+            logger.error(f"Response text: {e.response.text}")
         raise e
     except (KeyError, IndexError) as e:
         logger.error(f"Unexpected response format from LMStudio: {e}")
@@ -488,6 +504,21 @@ def anthropic_inference(
                 break
 
 
+def check_lmstudio_health(lmstudio_url):
+    """Check if LMStudio server is running and accessible."""
+    try:
+        response = requests.get(f"{lmstudio_url}/v1/models", timeout=10)
+        if response.status_code == 200:
+            logger.info("LMStudio server is running and accessible")
+            return True
+        else:
+            logger.error(f"LMStudio server returned status {response.status_code}")
+            return False
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Failed to connect to LMStudio: {e}")
+        return False
+
+
 def lmstudio_inference(
     test_dataset,
     model_name_or_path,
@@ -510,6 +541,10 @@ def lmstudio_inference(
     # Get LMStudio URL from environment variable or use default
     lmstudio_url = os.environ.get("LMSTUDIO_URL", "http://localhost:1234")
     print(f"Using LMStudio URL: {lmstudio_url}")
+    
+    # Check if LMStudio is running
+    if not check_lmstudio_health(lmstudio_url):
+        raise RuntimeError(f"LMStudio server is not accessible at {lmstudio_url}. Please start LMStudio and load a model.")
     
     # Use a simple tokenizer for length estimation (GPT-4 tokenizer as fallback)
     try:
@@ -646,6 +681,21 @@ def main(
     if split not in dataset:
         raise ValueError(f"Invalid split {split} for dataset {dataset_name_or_path}")
     dataset = dataset[split]
+    
+    # Check if dataset has the required "text" column
+    if "text" not in dataset.column_names:
+        available_columns = ", ".join(dataset.column_names)
+        raise ValueError(
+            f"Dataset does not have a 'text' column. Available columns: {available_columns}\n"
+            f"For inference, please use a preprocessed dataset with 'text' column such as:\n"
+            f"- princeton-nlp/SWE-bench_oracle\n"
+            f"- princeton-nlp/SWE-bench_bm25_13K\n"
+            f"- princeton-nlp/SWE-bench_bm25_27K\n"
+            f"- princeton-nlp/SWE-bench_bm25_40K\n"
+            f"\nTo create your own text dataset, use:\n"
+            f"python -m swebench.inference.make_datasets.create_text_dataset"
+        )
+    
     lens = np.array(list(map(len, dataset["text"])))
     dataset = dataset.select(np.argsort(lens))
     if len(existing_ids) > 0:
